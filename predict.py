@@ -1,37 +1,14 @@
 # Prediction interface for Cog ⚙️
 # https://cog.run/python
 
-from dotenv import load_dotenv
-
-load_dotenv()  # Always load .env at the start
-
 import os
 import requests
-import tempfile
 from pathlib import Path
-from typing import Optional
-from cog import BasePredictor, Input, Path as CogPath
+from cog import BasePredictor, Input, Path as CogPath, Secret
 from openai import OpenAI
 import replicate
 from pydantic import BaseModel
 import base64
-
-try:
-    from langfuse import Langfuse
-    from langfuse.decorators import observe
-except ImportError:
-    # Fallback if Langfuse is not installed
-    Langfuse = None
-
-    def observe(name=None):
-        def decorator(func):
-            return func
-
-        return decorator
-
-
-import cloudinary
-import cloudinary.uploader
 
 
 class ImageResizePrompt(BaseModel):
@@ -45,60 +22,12 @@ class ImageResizePrompt(BaseModel):
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        print("[setup] Initializing Image Resizing Tool...")
+        print("[setup] Initializing Image Resizing Tool with Seedream-4...")
 
         # Create output directories for saving results
         os.makedirs("/tmp/outputs", exist_ok=True)
 
-        # Initialize OpenAI client (optional during build, required during prediction)
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            self.openai_client = OpenAI(api_key=openai_key)
-            print("[setup] OpenAI client initialized")
-        else:
-            self.openai_client = None
-            print(
-                "[setup] OpenAI API key not found - will initialize during prediction"
-            )
-
-        # Set Replicate API token for model calls
-        replicate_token = os.getenv("REPLICATE_API_TOKEN")
-        if replicate_token:
-            os.environ["REPLICATE_API_TOKEN"] = replicate_token
-
-        # Configure Cloudinary for image uploads
-        if all(
-            [
-                os.getenv("NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME"),
-                os.getenv("CLOUDINARY_API_KEY"),
-                os.getenv("CLOUDINARY_API_SECRET"),
-            ]
-        ):
-            cloudinary.config(
-                cloud_name=os.getenv("NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME"),
-                api_key=os.getenv("CLOUDINARY_API_KEY"),
-                api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-            )
-
-        # Initialize Langfuse for tracking (optional, does not break if missing)
-        self.langfuse = None
-        if (
-            Langfuse is not None
-            and os.getenv("LANGFUSE_SECRET_KEY")
-            and os.getenv("LANGFUSE_PUBLIC_KEY")
-        ):
-            try:
-                self.langfuse = Langfuse(
-                    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-                    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-                    host="https://cloud.langfuse.com",
-                )
-                print("[setup] Langfuse initialized for tracking")
-            except Exception as e:
-                print(f"[setup] Langfuse initialization failed: {e}")
-                self.langfuse = None
-
-        print("[setup] Image Resizing Tool initialized successfully")
+        print("[setup] Image Resizing Tool with Seedream-4 initialized successfully")
 
     def _is_url(self, input_image) -> bool:
         """Check if the input is a public URL."""
@@ -122,14 +51,27 @@ class Predictor(BasePredictor):
             choices=["standard", "high", "ultra"],
             default="high",
         ),
+        openai_api_key: Secret = Input(description="OpenAI API key for image analysis"),
+        replicate_api_token: Secret = Input(
+            description="Replicate API token for image generation"
+        ),
+        debug_mode: bool = Input(
+            description="Enable debug mode",
+            default=False,
+        ),
     ) -> CogPath:
-        """Resize image to target aspect ratio while maintaining content integrity"""
+        """Resize image to target aspect ratio using Seedream-4 while maintaining content integrity"""
         try:
             print(f"[resize] Starting image resize process...")
             print(f"[resize] Target aspect ratio: {aspect_ratio}")
             print(f"[resize] Quality level: {quality}")
 
-            self._ensure_openai_client()
+            # Initialize OpenAI client with secret input
+            openai_client = OpenAI(api_key=openai_api_key.get_secret_value())
+
+            # Set Replicate API token from secret input
+            os.environ["REPLICATE_API_TOKEN"] = replicate_api_token.get_secret_value()
+
             self._validate_resize_inputs(input_image, aspect_ratio)
 
             # Step 1: Prepare image input (URL or base64)
@@ -141,10 +83,12 @@ class Predictor(BasePredictor):
                 print("[input] Using base64-encoded image input.")
 
             # Step 2: Analyze image with OpenAI to generate a detailed resize prompt
-            resize_analysis = self._analyze_image_for_resize(image_input, aspect_ratio)
+            resize_analysis = self._analyze_image_for_resize(
+                openai_client, image_input, aspect_ratio
+            )
 
-            # Step 3: Generate resized image using Replicate (Flux Kontext Dev)
-            resized_image_url = self._resize_with_flux_kontext(
+            # Step 3: Generate resized image using Replicate (Seedream-4)
+            resized_image_url = self._resize_with_seedream4(
                 image_input, resize_analysis.resize_prompt, aspect_ratio, quality
             )
 
@@ -157,17 +101,6 @@ class Predictor(BasePredictor):
         except Exception as e:
             print(f"[resize] Error in resize pipeline: {str(e)}")
             return input_image
-
-    def _ensure_openai_client(self):
-        """Ensure OpenAI client is initialized (for runtime prediction)"""
-        if self.openai_client is None:
-            openai_key = os.getenv("OPENAI_API_KEY")
-            if not openai_key:
-                raise ValueError(
-                    "OPENAI_API_KEY environment variable is required for predictions"
-                )
-            self.openai_client = OpenAI(api_key=openai_key)
-            print("[client] OpenAI client initialized for prediction")
 
     def _validate_resize_inputs(self, input_image: CogPath, aspect_ratio: str) -> None:
         """Validate input parameters: image must exist, aspect ratio must be valid"""
@@ -190,27 +123,8 @@ class Predictor(BasePredictor):
 
         print(f"[validation] Input validation passed")
 
-    def _upload_image_to_cloudinary(self, image_path: CogPath) -> str:
-        """Upload image to Cloudinary and return a public URL for downstream use"""
-        try:
-            print("[upload] Uploading image to Cloudinary...")
-
-            result = cloudinary.uploader.upload(
-                str(image_path), folder="resizing_tool", resource_type="image"
-            )
-
-            image_url = result["secure_url"]
-            print(f"[upload] Image uploaded successfully")
-            return image_url
-
-        except Exception as e:
-            print(f"[upload] Cloudinary upload failed: {e}")
-            # Fallback: convert to base64 or use local path (not implemented here)
-            raise Exception(f"Failed to upload image: {str(e)}")
-
-    @observe(name="analyze_image_for_resize")
     def _analyze_image_for_resize(
-        self, image_input: dict, target_aspect_ratio: str
+        self, openai_client: OpenAI, image_input: dict, target_aspect_ratio: str
     ) -> ImageResizePrompt:
         """
         Analyze image with OpenAI and generate a detailed resize prompt.
@@ -252,9 +166,6 @@ Respond with the resize prompt, aspect ratio description, and layout adjustments
 
             user_prompt = f"Analyze this image and create a resize prompt for {target_aspect_ratio} aspect ratio. Maintain all visual elements while optimizing the layout for the new dimensions."
 
-            if self.openai_client is None:
-                raise ValueError("OpenAI client not initialized")
-
             # Prepare OpenAI message content
             content = [
                 {"type": "text", "text": user_prompt},
@@ -273,7 +184,7 @@ Respond with the resize prompt, aspect ratio description, and layout adjustments
                     }
                 )
 
-            response = self.openai_client.beta.chat.completions.parse(
+            response = openai_client.beta.chat.completions.parse(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -300,8 +211,7 @@ Respond with the resize prompt, aspect ratio description, and layout adjustments
                 layout_adjustments="Optimized layout for new aspect ratio",
             )
 
-    @observe(name="resize_with_flux_kontext")
-    def _resize_with_flux_kontext(
+    def _resize_with_seedream4(
         self,
         image_input: dict,
         resize_prompt: str,
@@ -309,48 +219,51 @@ Respond with the resize prompt, aspect ratio description, and layout adjustments
         quality: str,
     ) -> str:
         """
-        Generate resized image using Flux Kontext Dev.
+        Generate resized image using Seedream-4.
         Accepts either a public URL or base64-encoded image.
         """
         try:
-            print(f"[flux] Generating resized image with Flux Kontext Dev...")
+            print(f"[seedream4] Generating resized image with Seedream-4...")
+
+            # Map quality levels to image sizes
             quality_settings = {
-                "standard": {"num_inference_steps": 20, "guidance": 2.0},
-                "high": {"num_inference_steps": 30, "guidance": 2.5},
-                "ultra": {"num_inference_steps": 40, "guidance": 3.0},
+                "standard": "1K",  # 1024px
+                "high": "2K",  # 2048px
+                "ultra": "4K",  # 4096px
             }
-            settings = quality_settings.get(quality, quality_settings["high"])
+            size = quality_settings.get(quality, quality_settings["high"])
 
             # Prepare input for Replicate
-            flux_input = {
+            seedream_input = {
                 "prompt": resize_prompt,
                 "aspect_ratio": aspect_ratio,
-                "output_format": "jpg",
-                "num_inference_steps": settings["num_inference_steps"],
-                "guidance": settings["guidance"],
-                "go_fast": False,
-                "output_quality": 100,
-                "disable_safety_checker": True,
+                "size": size,
+                "sequential_image_generation": "disabled",
+                "max_images": 1,
             }
+
             # Add image input as either URL or base64
             if "url" in image_input:
-                flux_input["input_image"] = image_input["url"]
+                seedream_input["image_input"] = [image_input["url"]]
             elif "base64" in image_input:
-                flux_input["input_image"] = (
+                seedream_input["image_input"] = [
                     f"data:image/png;base64,{image_input['base64']}"
-                )
+                ]
 
-            print(
-                f"[flux] Calling Flux Kontext Dev with {settings['num_inference_steps']} steps..."
-            )
-            output = replicate.run(
-                "black-forest-labs/flux-kontext-dev", input=flux_input
-            )
-            print(f"[flux] Image generation completed successfully")
-            return str(output)
+            print(f"[seedream4] Calling Seedream-4 with {size} resolution...")
+            output = replicate.run("bytedance/seedream-4", input=seedream_input)
+
+            # Seedream-4 returns an array of URLs, we take the first one
+            if isinstance(output, list) and len(output) > 0:
+                result_url = output[0]
+            else:
+                result_url = str(output)
+
+            print(f"[seedream4] Image generation completed successfully")
+            return result_url
 
         except Exception as e:
-            print(f"[flux] Flux Kontext Dev generation failed: {e}")
+            print(f"[seedream4] Seedream-4 generation failed: {e}")
             raise Exception(f"Failed to generate resized image: {str(e)}")
 
     def _download_final_image(self, image_url: str) -> CogPath:
@@ -394,13 +307,3 @@ Respond with the resize prompt, aspect ratio description, and layout adjustments
                     pass
         except:
             pass
-
-
-# Helper to require environment variables
-
-
-def require_env(var: str) -> str:
-    value = os.getenv(var)
-    if not value:
-        raise EnvironmentError(f"Missing required environment variable: {var}")
-    return value
